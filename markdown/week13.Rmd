@@ -1,0 +1,173 @@
+---
+title: "Week 13 Project"
+author: "Charlene Zhang"
+date: "4/20/2020"
+output: pdf_document
+---
+
+# R Studio API Code
+
+```{r,include=F}
+knitr::opts_chunk$set(echo = TRUE)
+# library(rstudioapi)
+# setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+```
+
+# Libraries & Authorization
+```{r,include=F}
+library(tidyverse)
+library(caret)
+library(twitteR)
+library(tm)
+library(qdap)
+library(textstem)
+library(RWeka)
+library(wordcloud)
+library(wesanderson)
+library(parallel)
+library(doParallel)
+library(ldatuning)
+library(lda)
+library(topicmodels)
+library(tidytext)
+# api <- "vRCyYyyt624fJ0KPUONmVNwLJ"
+# secret <- "W2lYRg4YtrdWZDp08diiTCtzQo0ReIJYwBiG09ayocP5I5kfNA"
+# token <- "1243243520560902146-pIz4oklYVDoTNxkZNc2QAZI3Ds8VRr"
+# sectoken <- "wIrbBNBVFEDM1YGJtBHnnVddyChviiSeLo0lXNPmovO7J"
+# setup_twitter_oauth(api,secret,token,sectoken)
+```
+
+# Data Import and Cleaning
+```{r, include=F}
+# imported_tbl <- searchTwitter(searchString="harry potter -filter:retweets",
+#                               lang="en",
+#                               n=1000) %>%
+#   twListToDF %>%
+#   dplyr::select(text,favoriteCount)
+# imported_tbl$text <- imported_tbl$text %>%
+#   iconv("UTF-8","ASCII",sub="")
+# write_csv(imported_tbl,"../output/tweets_original.csv")
+imported_tbl <- read_csv("../output/tweets_original.csv")
+
+# Pre-Processing
+myCorpus <- VCorpus(VectorSource(imported_tbl$text))
+myCorpus <- tm_map(myCorpus,PlainTextDocument)
+myCorpus <- tm_map(myCorpus,content_transformer(replace_abbreviation))
+myCorpus <- tm_map(myCorpus,content_transformer(replace_contraction))
+myCorpus <- tm_map(myCorpus,content_transformer(str_to_lower))
+myCorpus <- tm_map(myCorpus,content_transformer(rm_url)) 
+myCorpus <- tm_map(myCorpus,removeNumbers)
+myCorpus <- tm_map(myCorpus,removePunctuation)
+myCorpus <- tm_map(myCorpus,removeWords,c(stopwords("en"),"harry","potter")) 
+myCorpus <- tm_map(myCorpus,stripWhitespace)
+twitter_cp <- tm_map(myCorpus,lemmatize_words) 
+
+Tokenizer <- function(s){
+  NGramTokenizer(s,
+                 Weka_control(min=1,max=2))
+} 
+
+twitter_dtm <- DocumentTermMatrix(twitter_cp,
+                                  control=list(tokenize=Tokenizer)) %>%
+  removeSparseTerms(.98)
+cleaned_dtm <- twitter_dtm[apply(twitter_dtm,1,sum)>0,]
+dropped_tbl <- imported_tbl %>%
+  cbind(as.matrix(twitter_dtm)) 
+dropped_tbl <- dropped_tbl[apply(dropped_tbl[,3:30],1,sum)>0,]
+```
+Read in 1000 non-retweet tweets and removed emoticons and emojis and saved extracted data.
+Preprocessed tweets by
+* creating plain text document
+* replacing abbreviations and contractions with full words
+* turning all letter to lower case
+* removing any URLs, numbers, or punctuation
+* removing stopwords as well as the words "harry" and "potter" because they are included in every tweet by definition
+* stripping any white space
+* turning words into lemmas
+* converting into DTM
+* removing sparse terms (0 in 98% of documents)
+* combining with original dataset (favorite count) and removing cases with no tokens retained
+
+# Visualization
+```{r,message=F,warning=F}
+twitter_tbl <- dropped_tbl[,3:30]
+count <- tibble(words=colnames(twitter_tbl),
+                freq=apply(twitter_tbl,2,sum)) %>%
+  arrange(desc(freq))
+wordcloud(words=count$words,
+          freq=count$freq,
+          colors=wes_palette("Royal2"),
+          scale=c(3,.5), # range of font sizes
+          random.order=F)
+ggplot(count,aes(x=reorder(words,-freq),y=freq))+
+  geom_bar(stat="identity",fill=wes_palette("Royal2",1))+
+  theme(axis.text.x=element_text(angle=45,hjust=1))
+```
+
+# Analysis: Topic Modeling
+```{r,message=F,warning=F}
+tuning <- FindTopicsNumber(cleaned_dtm,
+                           topic=seq(2,20,1),
+                           metrics=c("Griffiths2004",
+                                     "CaoJuan2009",
+                                     "Arun2010",
+                                     "Deveaud2014"),
+                           verbose=F)
+FindTopicsNumber_plot(tuning)
+## run LDA
+lda_10 <- LDA(cleaned_dtm,k=10)
+top_terms <- terms(lda_10,10) # top 10 terms in each topic
+lda_betas <- tidy(lda_10,matrix="beta") # probability that a word belongs to a topic
+lda_betas %>%
+  group_by(topic) %>%
+  top_n(10,beta) %>%
+  arrange(topic,beta) %>%
+  View
+lda_gammas <- tidy(lda_10,matrix="gamma") # probability that tweets contain topics
+lda_gammas$document <- rep(1:530,10)
+lda_gammas %>%
+  group_by(topic) %>%
+  top_n(10,gamma) %>%
+  arrange(topic,gamma) %>%
+  View # can generate topic names based on this
+categories <- lda_gammas %>%
+  group_by(document) %>%
+  top_n(1,gamma) %>%
+  slice(1) %>%
+  ungroup %>%
+  mutate(document=as.numeric(document)) %>%
+  arrange(document) %>%
+  select(topic) # determine the most popular topic for each tweet
+twitter_tbl <- cbind(twitter_tbl,categories)
+```
+In choosing the number of topics to model, the goal is to minimize Griffiths2004 and CaoJuan2009 indices and maximize Arun2010 and Deveaud2014 indices. Therefore, 10 topics are chosen.
+LDA was performed to explore topics undering tweets. A variable representing the most likely topic per tweet in added. 
+
+# Analysis: Machine Learning
+```{r,mmessage=F,warning=F}
+twitter_tbl$favoriteCount <- dropped_tbl$favoriteCount
+local_cluster <- makeCluster(detectCores()-1)
+registerDoParallel(local_cluster)
+svm1 <- train(
+  favoriteCount~.-topic,
+  twitter_tbl,
+  method="svmLinear",
+  trControl=trainControl(method="cv",number=10,verboseIter=F),
+  na.action=na.pass
+)
+svm2 <- train(
+  favoriteCount~.,
+  twitter_tbl,
+  method="svmLinear",
+  trControl=trainControl(method="cv",number=10,verboseIter=F),
+  na.action=na.pass
+)
+stopCluster(local_cluster)
+dotplot(resamples(list("without topics"=svm1,"with topics"=svm2)))
+summary(resamples(list("without topics"=svm1,"with topics"=svm2)))
+```
+Ran two support vector regression models and 10-fold CV, the first without topic and the second with topic. 
+The model with topic assignment yielded higher Rsquared and lower RMSE and therefore performed better.
+
+# Analysis: Final Interpretation
+Topics can be important in predicting tweet popularity. However, topic categorizations in this case were generated based on a fairly small number of tweets and top terms could not be easily distinguished from each other. There was also larger overlap in top terms among different topics. Results should be interpreted with caution.
